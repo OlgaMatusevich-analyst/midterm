@@ -26,8 +26,8 @@
   </style>
 </head>
 <body>
-  <h1>Attrition Prediction Dashboard</h1>
-  <div class="sub">Upload IBM HR Attrition CSV → run EDA → train Dense NN in the browser → view metrics and confusion matrix.</div>
+  <h1>Attrition Prediction</h1>
+  <div class="sub">Upload IBM HR Attrition CSV → run EDA → train GRU (single timestep) in the browser → view metrics and confusion matrix.</div>
 
   <div class="grid">
     <div class="card">
@@ -51,7 +51,8 @@
         <div><label>Epochs</label><br/><input id="epochs" type="number" value="20" min="1" max="200" style="width:90px"/></div>
         <div><label>Batch</label><br/><input id="batchSize" type="number" value="32" min="1" max="512" style="width:90px"/></div>
         <div><label>LR</label><br/><input id="lr" type="number" value="0.001" step="0.0001" style="width:110px"/></div>
-        <div><label>Hidden units</label><br/><input id="units" type="number" value="64" min="8" max="256" style="width:110px"/></div>
+        <div><label>GRU units</label><br/><input id="units" type="number" value="64" min="8" max="256" style="width:110px"/></div>
+        <div><label>GRU layers</label><br/><input id="layers" type="number" value="1" min="1" max="3" style="width:90px"/></div>
       </div>
       <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap">
         <button id="buildBtn" disabled>Build Model</button>
@@ -100,11 +101,11 @@
 
   <script type="module">
     import { DataLoader } from './data-loader.js';
-    import { DenseClassifier } from './model.js';
+    import { GRUClassifier } from './gru.js';
     import { App } from './app.js';
 
     const dl = new DataLoader({log: logLine});
-    const model = new DenseClassifier({log: logLine});
+    const model = new GRUClassifier({log: logLine});
 
     const app = new App({ tf, Chart, dl, model, ui: {
       csvFile: document.getElementById('csvFile'),
@@ -121,6 +122,7 @@
       batchSize: document.getElementById('batchSize'),
       lr: document.getElementById('lr'),
       units: document.getElementById('units'),
+      layers: document.getElementById('layers'),
       prog: document.getElementById('prog'),
       dataStatus: document.getElementById('dataStatus'),
       // metrics + cm
