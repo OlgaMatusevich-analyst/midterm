@@ -1,6 +1,5 @@
 // data-loader.js
-// ES module to parse local CSV, build a (pseudo) time-series dataset, and export tf.Tensors.
-// Handles categorical encoding, numeric scaling, chronological split, and memory safety.
+// Parse local CSV, run EDA, one-hot encode categoricals, scale numerics, split into train/test, export 2D tensors.
 
 export class DataLoader {
   constructor(opts = {}) {
@@ -9,6 +8,7 @@ export class DataLoader {
     this.raw = [];
     this.labelKey = 'Attrition';
     this.attritionMap = { Yes: 1, No: 0 };
+
     this.numCols = new Set([
       'Age','DailyRate','DistanceFromHome','Education','EmployeeCount','EmployeeNumber',
       'EnvironmentSatisfaction','HourlyRate','JobInvolvement','JobLevel','JobSatisfaction',
@@ -17,106 +17,120 @@ export class DataLoader {
       'TrainingTimesLastYear','WorkLifeBalance','YearsAtCompany','YearsInCurrentRole',
       'YearsSinceLastPromotion','YearsWithCurrManager'
     ]);
-    this.catCols = [];      // resolved after reading headers
-    this.encoders = {};     // { colName: {categoryValue: index, ...}, ...}
-    this.scalers = {};      // { colName: {mean, std} }
-    this.featureOrder = []; // final expanded feature names (after one-hot)
+    this.catKnown = new Set([
+      'BusinessTravel','Department','EducationField','Gender','JobRole','MaritalStatus','Over18','OverTime'
+    ]);
+
+    this.catCols = [];
+    this.encoders = {}; // { col: {value:index} }
+    this.featureOrder = [];
+    this.scaler = null; // { mean:[], std:[] }
   }
 
   async fromFile(file) {
     if (!file) throw new Error('No file selected.');
     const text = await this.#readFileText(file);
     const { headers, rows } = this.#parseCSV(text);
-    this.headers = headers;
 
     if (!headers.includes(this.labelKey)) {
-      throw new Error(`CSV is missing required label column: ${this.labelKey}`);
+      throw new Error(`Missing required column: ${this.labelKey}`);
     }
 
-    // Determine categorical columns (non-numeric or known categorical)
-    const knownCategoricals = new Set([
-      'BusinessTravel','Department','EducationField','Gender','JobRole','MaritalStatus','Over18','OverTime'
-    ]);
-    this.catCols = headers.filter(h => knownCategoricals.has(h));
-
-    // Keep only required columns (ignore extras gracefully)
+    this.headers = headers;
+    this.catCols = headers.filter(h => this.catKnown.has(h));
     const allowed = new Set([...this.numCols, ...this.catCols, this.labelKey]);
-    const filteredRows = rows.map(r => {
+
+    this.raw = rows.map(r => {
       const obj = {};
-      for (const k of headers) {
-        if (allowed.has(k)) obj[k] = r[k];
-      }
+      for (const k of headers) if (allowed.has(k)) obj[k] = r[k];
       return obj;
     });
 
-    this.raw = filteredRows;
-    this.log(`Loaded ${this.raw.length} rows, ${this.catCols.length} categorical, ${this.numCols.size} numeric.`);
+    this.log(`Loaded ${this.raw.length} rows (${this.catCols.length} categorical, ${this.numCols.size} numeric).`);
     return this;
   }
 
-  // Prepare tensors. seqLen>=1 creates sliding windows across rows sorted by a proxy "time".
-  prepareTensors({ seqLen = 1, testSplit = 0.2 }) {
+  // ============== EDA ==============
+  eda() {
+    if (!this.raw?.length) throw new Error('Load data first.');
+    const n = this.raw.length;
+
+    // class balance
+    let pos = 0, neg = 0;
+    for (const r of this.raw) (String(r[this.labelKey]) === 'Yes') ? pos++ : neg++;
+    const balance = { positive: pos, negative: neg, rate: pos / Math.max(1, n) };
+
+    // numeric summary (mean ± std) — not displayed, but can be logged/useful
+    const y = this.raw.map(r => (String(r[this.labelKey]) === 'Yes' ? 1 : 0));
+    const corr = {};
+    for (const col of this.numCols) {
+      const x = this.raw.map(r => Number(r[col] ?? 0));
+      corr[col] = this.#pearson(x, y);
+    }
+    const topCorr = Object.entries(corr).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,8);
+
+    // categorical attrition rates for OverTime and JobRole
+    const catRates = {};
+    for (const col of ['OverTime','JobRole']) {
+      if (!this.catCols.includes(col)) continue;
+      const rates = {};
+      for (const r of this.raw) {
+        const k = r[col] ?? '';
+        if (!rates[k]) rates[k] = { pos:0, total:0 };
+        rates[k].pos += (String(r[this.labelKey])==='Yes') ? 1 : 0;
+        rates[k].total += 1;
+      }
+      const out = Object.entries(rates).map(([k,v]) => ({ k, rate: v.pos/Math.max(1,v.total) }))
+                                      .sort((a,b)=>b.rate-a.rate);
+      catRates[col] = out;
+    }
+
+    return { balance, topCorr, catRates };
+  }
+
+  // ============== Tensors ==============
+  prepareTensors({ testSplit = 0.2 }) {
     if (!this.raw?.length) throw new Error('Dataset not loaded.');
 
-    // Sort "chronologically": by YearsAtCompany asc, then EmployeeNumber asc (deterministic).
-    const sorted = [...this.raw].sort((a, b) => {
-      const ya = Number(a.YearsAtCompany ?? 0), yb = Number(b.YearsAtCompany ?? 0);
-      if (ya !== yb) return ya - yb;
-      return Number(a.EmployeeNumber ?? 0) - Number(b.EmployeeNumber ?? 0);
-    });
+    // build encoders for categoricals
+    this.#fitCategoricals(this.raw);
 
-    // Build encoders for categoricals
-    this.#fitCategoricals(sorted);
-
-    // Fit numeric scalers on train-only portion later. First transform all to feature vectors.
+    // build raw feature vectors + labels
     const feats = [];
     const labels = [];
-    for (const r of sorted) {
+    for (const r of this.raw) {
       const { v, y } = this.#rowToFeatures(r);
-      feats.push(v);
-      labels.push(y);
+      feats.push(v); labels.push(y);
     }
 
-    // Create sliding windows (time steps)
-    const S = Math.max(1, Number(seqLen) | 0);
-    const X_seq = [];
-    const y_seq = [];
-    for (let i = 0; i + S - 1 < feats.length; i++) {
-      const window = feats.slice(i, i + S);
-      // label is the last row's label (next outcome)
-      const target = labels[i + S - 1];
-      X_seq.push(window);
-      y_seq.push([target]);
-    }
+    // deterministic shuffle, then split
+    const idx = this.#deterministicShuffleIndex(feats.length);
+    const nTest = Math.max(1, Math.floor(feats.length * Math.min(Math.max(testSplit,0.05),0.9)));
+    const nTrain = feats.length - nTest;
 
-    // Chronological split
-    const n = X_seq.length;
-    const nTest = Math.max(1, Math.floor(n * Math.min(Math.max(Number(testSplit) / 100 || testSplit, 0.05), 0.9)));
-    const nTrain = n - nTest;
+    const trainIdx = idx.slice(0, nTrain);
+    const testIdx  = idx.slice(nTrain);
 
-    const Xtr = X_seq.slice(0, nTrain);
-    const ytr = y_seq.slice(0, nTrain);
-    const Xte = X_seq.slice(nTrain);
-    const yte = y_seq.slice(nTrain);
+    const Xtr = trainIdx.map(i => feats[i]);
+    const ytr = trainIdx.map(i => [labels[i]]);
+    const Xte = testIdx.map(i => feats[i]);
+    const yte = testIdx.map(i => [labels[i]]);
 
-    // Fit scalers only on training portion (per feature dimension)
-    this.#fitScalers(Xtr);
+    // scale on train only
+    this.#fitScaler(Xtr);
+    const XtrS = this.#applyScaler(Xtr);
+    const XteS = this.#applyScaler(Xte);
 
-    // Apply scaling
-    const XtrScaled = this.#applyScaling(Xtr);
-    const XteScaled = this.#applyScaling(Xte);
-
-    const xTrain = tf.tensor3d(XtrScaled);
+    const xTrain = tf.tensor2d(XtrS);
     const yTrain = tf.tensor2d(ytr);
-    const xTest = tf.tensor3d(XteScaled);
-    const yTest = tf.tensor2d(yte);
+    const xTest  = tf.tensor2d(XteS);
+    const yTest  = tf.tensor2d(yte);
 
     this.log(`Prepared tensors: xTrain ${xTrain.shape}, yTrain ${yTrain.shape}, xTest ${xTest.shape}, yTest ${yTest.shape}`);
     return { xTrain, yTrain, xTest, yTest, attritionMap: this.attritionMap, featureOrder: this.featureOrder.slice() };
   }
 
-  // ---- internal helpers ----
-
+  // ------------- helpers -------------
   #readFileText(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -127,15 +141,13 @@ export class DataLoader {
   }
 
   #parseCSV(text) {
-    // Simple CSV parser suitable for IBM Attrition dataset (no quoted commas in practice).
     const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').filter(Boolean);
     if (lines.length < 2) throw new Error('CSV has no data.');
     const headers = lines[0].split(',').map(h => h.trim());
     const rows = [];
-
     for (let i = 1; i < lines.length; i++) {
       const parts = lines[i].split(',');
-      if (parts.length !== headers.length) continue; // skip malformed lines
+      if (parts.length !== headers.length) continue;
       const obj = {};
       for (let j = 0; j < headers.length; j++) obj[headers[j]] = parts[j].trim();
       rows.push(obj);
@@ -144,16 +156,14 @@ export class DataLoader {
   }
 
   #fitCategoricals(rows) {
+    this.encoders = {};
     for (const c of this.catCols) {
       const set = new Set();
       for (const r of rows) set.add(r[c] ?? '');
       const cats = Array.from(set.values()).sort();
-      const enc = {};
-      cats.forEach((v, i) => enc[v] = i);
+      const enc = {}; cats.forEach((v,i)=>enc[v]=i);
       this.encoders[c] = enc;
     }
-
-    // Build feature order (numeric + expanded categoricals)
     const order = [];
     for (const col of this.numCols) order.push(col);
     for (const c of this.catCols) {
@@ -164,13 +174,11 @@ export class DataLoader {
   }
 
   #rowToFeatures(r) {
-    // numeric
     const feat = [];
     for (const col of this.numCols) {
-      const val = Number(r[col] ?? 0);
-      feat.push(Number.isFinite(val) ? val : 0);
+      const v = Number(r[col] ?? 0);
+      feat.push(Number.isFinite(v) ? v : 0);
     }
-    // one-hot categoricals
     for (const c of this.catCols) {
       const enc = this.encoders[c];
       const vec = new Array(Object.keys(enc).length).fill(0);
@@ -182,29 +190,42 @@ export class DataLoader {
     return { v: feat, y };
   }
 
-  #fitScalers(X) {
-    // X: array of [timesteps][featdim]
-    const timesteps = X[0]?.length || 1;
-    const dim = X[0]?.[0]?.length || 0;
-    const all = [];
-    for (const seq of X) for (const t of seq) all.push(t);
-    const stats = [];
-    for (let j = 0; j < dim; j++) {
-      let s = 0, s2 = 0;
-      for (let i = 0; i < all.length; i++) {
-        const v = all[i][j];
-        s += v; s2 += v*v;
-      }
-      const n = all.length || 1;
-      const mean = s / n;
-      const std = Math.sqrt(Math.max(1e-9, s2/n - mean*mean));
-      stats.push({mean, std});
+  #fitScaler(X) {
+    const d = X[0]?.length || 0;
+    const mean = new Array(d).fill(0);
+    const std  = new Array(d).fill(0);
+    const n = X.length || 1;
+
+    for (let j=0;j<d;j++){
+      let s=0,s2=0;
+      for (let i=0;i<n;i++){ const v=X[i][j]; s+=v; s2+=v*v; }
+      mean[j]=s/n; std[j]=Math.sqrt(Math.max(1e-9, s2/n - mean[j]*mean[j]));
     }
-    this.scalers = { dimStats: stats };
+    this.scaler = { mean, std };
+  }
+  #applyScaler(X) {
+    const { mean,std } = this.scaler;
+    return X.map(row => row.map((v,j)=>(v-mean[j])/std[j]));
   }
 
-  #applyScaling(X) {
-    const dimStats = this.scalers.dimStats;
-    return X.map(seq => seq.map(t => t.map((v, j) => (v - dimStats[j].mean) / (dimStats[j].std))));
+  #deterministicShuffleIndex(n) {
+    // Fisher–Yates with fixed seed for reproducibility
+    const a = Array.from({length:n}, (_,i)=>i);
+    let seed = 1337;
+    const rand = () => (seed = (seed*1664525 + 1013904223) % 2**32) / 2**32;
+    for (let i=n-1;i>0;i--) { const j = Math.floor(rand()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; }
+    return a;
+  }
+
+  #pearson(x, y) {
+    const n = Math.min(x.length, y.length);
+    let sx=0, sy=0, sxx=0, syy=0, sxy=0;
+    for (let i=0;i<n;i++){ const xi=+x[i]; const yi=+y[i];
+      sx+=xi; sy+=yi; sxx+=xi*xi; syy+=yi*yi; sxy+=xi*yi; }
+    const cov = sxy/n - (sx/n)*(sy/n);
+    const vx = sxx/n - (sx/n)*(sx/n);
+    const vy = syy/n - (sy/n)*(sy/n);
+    const denom = Math.sqrt(Math.max(vx*vy,1e-12));
+    return cov/denom;
   }
 }
